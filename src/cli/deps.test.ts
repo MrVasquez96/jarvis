@@ -38,4 +38,25 @@ describe('CLI dependency helpers', () => {
       unresolved: ['xdg-open'],
     });
   });
+
+  test('dedupes unresolved entries when missing has duplicates', () => {
+    expect(resolveCoreInstallPlan('brew', 'linux', ['xdg-open', 'xdg-open'])).toEqual({
+      packages: [],
+      unresolved: ['xdg-open'],
+    });
+  });
+
+  test('maps wslview to wslu on WSL with apt', () => {
+    expect(resolveCoreInstallPlan('apt', 'wsl', ['git', 'wslview'])).toEqual({
+      packages: ['git', 'wslu'],
+      unresolved: [],
+    });
+  });
+
+  test('reports wslview unresolved on brew (no mapping)', () => {
+    expect(resolveCoreInstallPlan('brew', 'wsl', ['wslview'])).toEqual({
+      packages: [],
+      unresolved: ['wslview'],
+    });
+  });
 });
