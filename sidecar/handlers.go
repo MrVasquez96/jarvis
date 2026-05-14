@@ -35,6 +35,10 @@ func NewHandlerRegistry(cfg *SidecarConfig, availableCaps []SidecarCapability, o
 	if caps[CapScreenshot] {
 		registry["capture_screen"] = handleCaptureScreen
 	}
+	if caps[CapAwareness] {
+		registry["fetch_capture"] = makeFetchCaptureHandler(cfg)
+		registry["cleanup_captures"] = makeCleanupCapturesHandler(cfg)
+	}
 	if caps[CapSystemInfo] {
 		registry["get_system_info"] = handleGetSystemInfo
 	}
@@ -265,15 +269,21 @@ func handleSetClipboard(params map[string]any) (*RPCResult, error) {
 
 // --- Screenshot ---
 
-func handleCaptureScreen(params map[string]any) (*RPCResult, error) {
-	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("jarvis-screenshot-%d.png", time.Now().UnixMilli()))
+// captureScreenBytes invokes the platform screenshot tool, returning the raw PNG.
+// Both the RPC handler and the ScreenObserver use this to skip a base64
+// round-trip on the in-process path.
+func captureScreenBytes() ([]byte, error) {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("jarvis-screenshot-%d.png", time.Now().UnixNano()))
 	defer os.Remove(tmpFile)
 
 	if err := platformCaptureScreen(tmpFile); err != nil {
 		return nil, fmt.Errorf("screenshot capture failed: %w", err)
 	}
+	return os.ReadFile(tmpFile)
+}
 
-	data, err := os.ReadFile(tmpFile)
+func handleCaptureScreen(params map[string]any) (*RPCResult, error) {
+	data, err := captureScreenBytes()
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +296,126 @@ func handleCaptureScreen(params map[string]any) (*RPCResult, error) {
 			Data:     base64.StdEncoding.EncodeToString(data),
 		},
 	}, nil
+}
+
+// --- Awareness: fetch a saved capture by path ---
+
+// makeFetchCaptureHandler returns a handler that reads a previously-saved capture
+// PNG from disk and returns it as inline binary. The requested path is required
+// to resolve underneath the configured capture directory, with symlinks evaluated
+// so that a symlink inside the dir cannot point outside it.
+func makeFetchCaptureHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		raw, _ := params["path"].(string)
+		if raw == "" {
+			return nil, fmt.Errorf("missing required parameter: path")
+		}
+
+		captureDir, err := filepath.Abs(cfg.Awareness.CaptureDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve capture dir: %w", err)
+		}
+		if resolved, err := filepath.EvalSymlinks(captureDir); err == nil {
+			captureDir = resolved
+		}
+
+		target, err := filepath.Abs(raw)
+		if err != nil {
+			return nil, fmt.Errorf("resolve path: %w", err)
+		}
+		resolvedTarget, err := filepath.EvalSymlinks(target)
+		if err != nil {
+			return nil, fmt.Errorf("read capture: %w", err)
+		}
+
+		rel, err := filepath.Rel(captureDir, resolvedTarget)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("path not within capture dir")
+		}
+
+		data, err := os.ReadFile(resolvedTarget)
+		if err != nil {
+			return nil, fmt.Errorf("read capture: %w", err)
+		}
+
+		return &RPCResult{
+			Result: map[string]any{"size": len(data)},
+			Binary: BinaryDataInline{
+				Type:     "inline",
+				MimeType: "image/png",
+				Data:     base64.StdEncoding.EncodeToString(data),
+			},
+		}, nil
+	}
+}
+
+// --- Awareness: prune old capture files ---
+
+// makeCleanupCapturesHandler deletes capture files in CaptureDir whose mtime is
+// before the provided cutoff (epoch ms). Empty date directories are removed.
+// Returns counts so the brain can log progress.
+//
+// Safety: the cutoff must be in the past. A small clock-skew tolerance is
+// allowed (1 minute into the future), but we never wipe newer files than that.
+func makeCleanupCapturesHandler(cfg *SidecarConfig) RPCHandler {
+	return func(params map[string]any) (*RPCResult, error) {
+		beforeMs, ok := params["before_ms"].(float64)
+		if !ok || beforeMs <= 0 {
+			return nil, fmt.Errorf("missing or invalid before_ms")
+		}
+		cutoff := time.UnixMilli(int64(beforeMs))
+		if cutoff.After(time.Now().Add(time.Minute)) {
+			return nil, fmt.Errorf("cutoff must be in the past")
+		}
+
+		captureDir := cfg.Awareness.CaptureDir
+		filesDeleted := 0
+		dirsRemoved := 0
+
+		entries, err := os.ReadDir(captureDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return &RPCResult{Result: map[string]any{"files_deleted": 0, "dirs_removed": 0}}, nil
+			}
+			return nil, fmt.Errorf("read capture dir: %w", err)
+		}
+
+		for _, dateEntry := range entries {
+			if !dateEntry.IsDir() {
+				continue
+			}
+			dateDir := filepath.Join(captureDir, dateEntry.Name())
+			files, err := os.ReadDir(dateDir)
+			if err != nil {
+				continue
+			}
+			for _, f := range files {
+				if f.IsDir() {
+					continue
+				}
+				p := filepath.Join(dateDir, f.Name())
+				info, err := f.Info()
+				if err != nil {
+					continue
+				}
+				if info.ModTime().Before(cutoff) {
+					if err := os.Remove(p); err == nil {
+						filesDeleted++
+					}
+				}
+			}
+			if remaining, _ := os.ReadDir(dateDir); len(remaining) == 0 {
+				if err := os.Remove(dateDir); err == nil {
+					dirsRemoved++
+				}
+			}
+		}
+
+		return &RPCResult{Result: map[string]any{
+			"files_deleted": filesDeleted,
+			"dirs_removed":  dirsRemoved,
+		}}, nil
+	}
 }
 
 // --- Config Management ---
