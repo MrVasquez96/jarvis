@@ -1,8 +1,10 @@
 import YAML from 'yaml';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { chmod, writeFile } from 'node:fs/promises';
 import type { JarvisConfig } from './types.ts';
 import { DEFAULT_CONFIG } from './types.ts';
+import { secureParentDirectory } from '../util/fs-secure.ts';
 
 function expandTilde(filepath: string): string {
   if (filepath.startsWith('~/')) {
@@ -170,7 +172,9 @@ export async function saveConfig(
       defaultKeyType: 'PLAIN',
     });
 
-    await Bun.write(path, yaml);
+    await secureParentDirectory(path);
+    await writeFile(path, yaml, { mode: 0o600 });
+    await chmod(path, 0o600);
     console.log(`Config saved to ${path}`);
   } catch (err) {
     throw new Error(`Failed to save config to ${path}: ${err}`);

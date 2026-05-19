@@ -1,5 +1,25 @@
 import { describe, expect, test } from 'bun:test';
-import { buildEnrollmentUrls, isLocalhostBrainUrl } from './manager.ts';
+import { statSync } from 'node:fs';
+import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildEnrollmentUrls, isLocalhostBrainUrl, SidecarManager } from './manager.ts';
+
+function keyPaths(dataDir: string): { keyDir: string; privateKeyPath: string; publicKeyPath: string } {
+  const keyDir = join(dataDir, 'sidecar-keys');
+  return {
+    keyDir,
+    privateKeyPath: join(keyDir, 'private.pem'),
+    publicKeyPath: join(keyDir, 'public.pem'),
+  };
+}
+
+function expectKeyModes(dataDir: string): void {
+  const { keyDir, privateKeyPath, publicKeyPath } = keyPaths(dataDir);
+  expect(statSync(keyDir).mode & 0o777).toBe(0o700);
+  expect(statSync(privateKeyPath).mode & 0o777).toBe(0o600);
+  expect(statSync(publicKeyPath).mode & 0o777).toBe(0o644);
+}
 
 describe('buildEnrollmentUrls', () => {
   test('parses https URL into wss/https pair', () => {
@@ -86,5 +106,43 @@ describe('isLocalhostBrainUrl', () => {
     ['notlocalhost.example.com', false],
   ])('isLocalhostBrainUrl(%p) === %p', (input, expected) => {
     expect(isLocalhostBrainUrl(input)).toBe(expected);
+  });
+});
+
+describe('SidecarManager key storage', () => {
+  test('stores the enrollment private key with owner-only permissions', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'jarvis-sidecar-manager-'));
+    try {
+      const manager = new SidecarManager(dataDir);
+
+      await manager.start();
+      await manager.stop();
+
+      expectKeyModes(dataDir);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test('tightens existing enrollment key permissions on load', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'jarvis-sidecar-manager-'));
+    try {
+      const firstManager = new SidecarManager(dataDir);
+      await firstManager.start();
+      await firstManager.stop();
+
+      const { keyDir, privateKeyPath, publicKeyPath } = keyPaths(dataDir);
+      await chmod(keyDir, 0o777);
+      await chmod(privateKeyPath, 0o644);
+      await chmod(publicKeyPath, 0o666);
+
+      const secondManager = new SidecarManager(dataDir);
+      await secondManager.start();
+      await secondManager.stop();
+
+      expectKeyModes(dataDir);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 });
