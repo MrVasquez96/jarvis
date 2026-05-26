@@ -15,7 +15,7 @@ services:
     volumes:
       - jarvis-data:/data
       # Mount a custom config if you have one:
-      - ./config.yaml:/data/config.yaml:ro
+      - ./config.yaml:/data/.jarvis/config.yaml:ro
     environment:
       - JARVIS_API_KEY=${JARVIS_API_KEY}
       # - JARVIS_AUTH_TOKEN=${JARVIS_AUTH_TOKEN}
